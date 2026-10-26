@@ -48,10 +48,33 @@ def agora():
 
 
 # ------------------------------------------------------------------ IBGE
+LISTA_LOCAL = Path(__file__).resolve().parent.parent / "dados" / "municipios_ibge.json"   # [código, nome, UF]
+
+
+def _get_ibge(url, tentativas=4):
+    """GET na API do IBGE com novas tentativas (o servidor oscila e às vezes nem aceita a conexão)."""
+    for t in range(tentativas):
+        try:
+            r = requests.get(url, headers=UA, timeout=(20, 60))
+            r.raise_for_status()
+            return r
+        except requests.RequestException as e:
+            if t == tentativas - 1:
+                raise
+            log(f"  IBGE não respondeu ({type(e).__name__}); nova tentativa em {10 * (t + 1)} s")
+            time.sleep(10 * (t + 1))
+
+
 def meta_ibge(cd):
-    r = requests.get(f"{IBGE_API}/v1/localidades/municipios/{cd}", headers=UA, timeout=60)
-    r.raise_for_status()
-    j = r.json()
+    try:
+        j = _get_ibge(f"{IBGE_API}/v1/localidades/municipios/{cd}").json()
+    except requests.RequestException:
+        # API fora do ar: nome e UF vêm da lista do repositório; as regiões ficam em branco
+        for c, nome, uf in json.loads(LISTA_LOCAL.read_text(encoding="utf-8")):
+            if str(c) == str(cd):
+                log("  API de localidades do IBGE indisponível: usando nome e UF da lista local")
+                return {"nome": nome, "uf": uf, "rgi": "", "rgint": ""}
+        raise
     if not j:
         raise ValueError(f"Município {cd} não existe no IBGE")
     j = j[0] if isinstance(j, list) else j
@@ -64,8 +87,7 @@ def meta_ibge(cd):
 def area_oficial(cd):
     """Área territorial oficial (km²) pela API de agregados do IBGE; None se a API não responder."""
     try:
-        r = requests.get(f"{IBGE_API}/v3/agregados/1301/periodos/-1/variaveis/615?localidades=N6[{cd}]",
-                         headers=UA, timeout=60)
+        r = _get_ibge(f"{IBGE_API}/v3/agregados/1301/periodos/-1/variaveis/615?localidades=N6[{cd}]", tentativas=3)
         s = r.json()[0]["resultados"][0]["series"][0]["serie"]
         return float(list(s.values())[-1])
     except Exception:

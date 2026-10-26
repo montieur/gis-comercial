@@ -53,9 +53,14 @@ def recuperar_travados():
         log("pedido travado recolocado:", p["id"], novo["status"])
 
 
+FALHARAM_AGORA = set()   # pedidos que falharam nesta rodada: a nova tentativa espera alguns minutos
+
+
 def reservar():
     # pedidos de visitantes (gerar/atualizar) passam na frente da exportação em massa e das conferências
-    fila = rest("GET", "gc_pedidos?status=eq.fila&tipo=in.(gerar,atualizar)&order=criado_em.asc&limit=1&select=id,cd_mun,tipo,tentativas")         or rest("GET", "gc_pedidos?status=eq.fila&order=criado_em.asc&limit=1&select=id,cd_mun,tipo,tentativas")
+    fora = f"&id=not.in.({','.join(FALHARAM_AGORA)})" if FALHARAM_AGORA else ""
+    fila = rest("GET", f"gc_pedidos?status=eq.fila&tipo=in.(gerar,atualizar){fora}&order=criado_em.asc&limit=1&select=id,cd_mun,tipo,tentativas") \
+        or rest("GET", f"gc_pedidos?status=eq.fila{fora}&order=criado_em.asc&limit=1&select=id,cd_mun,tipo,tentativas")
     if not fila:
         return None
     p = fila[0]
@@ -149,6 +154,20 @@ def atualizar_planilha():
     log(f"planilha atualizada ({len(linhas)} municípios)")
 
 
+def mensagem_amigavel(e, ultima):
+    """Erro técnico -> frase para quem pediu (o detalhe técnico fica no log da automação)."""
+    t = str(e)
+    if "servicodados.ibge.gov.br" in t or "geoftp.ibge.gov.br" in t:
+        causa = "O servidor do IBGE não respondeu."
+    elif "overpass" in t.lower():
+        causa = "O servidor do OpenStreetMap não respondeu."
+    elif "Drive " in t or "googleapis" in t:
+        causa = "O Google Drive não respondeu ao guardar os arquivos."
+    else:
+        return t[:300]
+    return causa + (" Tente de novo mais tarde." if ultima else " O pedido será tentado de novo automaticamente em alguns minutos.")
+
+
 def conferir(cd):
     """Pedido 'verificar': confere IBGE e OSM e guarda o resultado no município (a função só lê daqui)."""
     linhas = rest("GET", f"gc_municipios?cd_mun=eq.{cd}&select=fontes,gerado_em") or []
@@ -164,10 +183,17 @@ def main():
     inicio = time.time()
     recuperar_travados()
     feitos = 0
+    esperas = [120, 300]           # novas tentativas dos que falharam, ainda nesta execução
     while feitos < MAX_PEDIDOS and (time.time() - inicio) / 60 < ORCAMENTO_MIN:
         p = reservar()
         if not p:
-            break
+            if not (FALHARAM_AGORA and esperas) or (time.time() - inicio) / 60 + esperas[0] / 60 > ORCAMENTO_MIN:
+                break
+            espera = esperas.pop(0)
+            log(f"{len(FALHARAM_AGORA)} pedido(s) falharam; nova tentativa em {espera // 60} min")
+            time.sleep(espera)
+            FALHARAM_AGORA.clear()
+            continue
         cd = p["cd_mun"]
         log(f"=== pedido {p['id']}: {p['tipo']} {cd}")
         try:
@@ -191,9 +217,11 @@ def main():
                  headers={"Content-Type": "application/json"})
         except Exception as e:     # noqa: BLE001 - qualquer falha vira mensagem para o usuário
             log("ERRO:", e)
+            FALHARAM_AGORA.add(p["id"])
+            ultima = p["tentativas"] + 1 >= MAX_TENTATIVAS
             rest("PATCH", f"gc_pedidos?id=eq.{p['id']}", json={
-                "status": "erro" if p["tentativas"] + 1 >= MAX_TENTATIVAS else "fila",
-                "mensagem": str(e)[:300], "concluido_em": agora().isoformat()},
+                "status": "erro" if ultima else "fila",
+                "mensagem": mensagem_amigavel(e, ultima), "concluido_em": agora().isoformat()},
                  headers={"Content-Type": "application/json"})
         feitos += 1
     if DRIVE and feitos:
